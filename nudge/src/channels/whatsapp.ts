@@ -1,0 +1,150 @@
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys'
+import type { WASocket } from '@whiskeysockets/baileys'
+import pino from 'pino'
+import PQueue from 'p-queue'
+import { onboardingService } from '../services/onboarding.service.js'
+import { conversationRepository } from '../repositories/conversation.repository.js'
+import { messageRepository } from '../repositories/message.repository.js'
+import { normalizePhone } from '../utils/phone.js'
+
+const sendQueue = new PQueue({ concurrency: 1 })
+
+let sock: WASocket | null = null
+let currentQR: string | null = null
+let connected = false
+let reconnectAttempts = 0
+const MAX_RECONNECT_ATTEMPTS = 5
+
+export async function init() {
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState('./wa-auth')
+
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: pino({ level: 'silent' }) as any,
+    })
+
+    sock.ev.on('creds.update', saveCreds)
+
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update
+
+      if (qr) {
+        currentQR = qr
+        console.log('[whatsapp] QR code available — scan at /api/whatsapp/qr')
+      }
+
+      if (connection === 'close') {
+        connected = false
+        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log('[whatsapp] Logged out, not reconnecting')
+        } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          console.error(`[whatsapp] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached, giving up`)
+        } else {
+          reconnectAttempts++
+          console.log(`[whatsapp] Connection closed, reconnecting (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`)
+          init().catch((err) => {
+            console.error('[whatsapp] Reconnect failed:', err)
+          })
+        }
+      } else if (connection === 'open') {
+        connected = true
+        currentQR = null
+        reconnectAttempts = 0
+        console.log('[whatsapp] Connected')
+      }
+    })
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const msg of messages) {
+      if (!msg.message || msg.key.fromMe) continue
+
+      console.log(`[whatsapp] Raw message:\n${JSON.stringify(msg, null, 2)}`)
+
+      const jid = msg.key.remoteJidAlt || msg.key.remoteJid
+      if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue
+
+      if (msg.key.remoteJidAlt) {
+        console.log(`[whatsapp] Using remoteJidAlt: ${msg.key.remoteJidAlt}`)
+      }
+
+      const phone = normalizePhone(jid.replace('@s.whatsapp.net', ''))
+      const text = msg.message.conversation || msg.message.extendedTextMessage?.text
+      if (!text) continue
+
+      console.log(`[whatsapp] Received from ${phone}: ${text}`)
+
+      const existingConversation = await conversationRepository.findByExternalId('whatsapp', phone)
+      if (existingConversation?.status === 'completed') {
+        await messageRepository.deleteByConversationId(existingConversation.id)
+        await conversationRepository.reset(existingConversation.id)
+      }
+
+      try {
+        const { response, followUp } = await onboardingService.handleMessage('whatsapp', phone, text)
+        await sendMessage(phone, response)
+        if (followUp) {
+          console.log(`[whatsapp] Sending follow-up to ${phone}`)
+          await sendMessage(phone, followUp)
+        } else {
+          console.log(`[whatsapp] No follow-up to send for ${phone}`)
+        }
+      } catch (error) {
+        console.error('[whatsapp] Error handling message:', error)
+        await sendMessage(phone, 'Perdón, tuve un problema procesando tu mensaje. ¿Podés intentar de nuevo?')
+      }
+    }
+  })
+
+    console.log('[whatsapp] Message listener registered')
+  } catch (error) {
+    console.error('[whatsapp] Init failed:', error)
+  }
+}
+
+export function getQR(): string | null {
+  return currentQR
+}
+
+export function isConnected(): boolean {
+  return connected
+}
+
+
+async function sendWithRetry(phone: string, text: string) {
+  const normalized = normalizePhone(phone)
+  const jid = `${normalized}@s.whatsapp.net`
+  const maxAttempts = 3
+  const delayMs = 3000
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(`[whatsapp] Sending to ${normalized} (attempt ${attempt}/${maxAttempts})`)
+      if (!sock) throw new Error('WhatsApp not initialized')
+
+      // Simulate human typing: subscribe, show "composing", wait 1-3s
+      await sock.presenceSubscribe(jid)
+      await sock.sendPresenceUpdate('composing', jid)
+      const typingDelay = 1000 + Math.random() * 2000
+      await new Promise((resolve) => setTimeout(resolve, typingDelay))
+
+      await sock.sendMessage(jid, { text })
+      await sock.sendPresenceUpdate('paused', jid)
+      console.log(`[whatsapp] Sent to ${normalized}`)
+      return
+    } catch (error) {
+      if (attempt === maxAttempts) {
+        console.error(`[whatsapp] Failed to ${normalized} after ${maxAttempts} attempts`)
+        throw error
+      }
+      console.warn(`[whatsapp] Attempt ${attempt} failed for ${normalized}, retrying in ${delayMs}ms...`)
+      await new Promise((resolve) => setTimeout(resolve, delayMs))
+    }
+  }
+}
+
+export async function sendMessage(phone: string, text: string) {
+  return sendQueue.add(() => sendWithRetry(phone, text))
+}

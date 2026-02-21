@@ -1,7 +1,8 @@
-# nudge.
-![Nudge Logo](./logo.png)
-
-**Configure your business by just chatting.**
+<p align="center">
+  <img src="./logo.png" alt="Nudge Logo" width="80" style="border-radius: 16px;" />
+</p>
+<h1 align="center">nudge.</h1>
+<p align="center"><strong>Configure your business by just chatting.</strong></p>
 
 Nudge is an AI-powered conversational onboarding platform. Instead of filling out forms, business owners configure their entire setup by chatting with an AI assistant on WhatsApp or Telegram.
 
